@@ -8,7 +8,7 @@ use lenient_semver_parser::{parse_partial, VersionBuilder};
 use lenient_version::Version;
 
 pub fn parse<'a>(input: &'a str) -> Result<RangeSet<'a>, Box<dyn std::error::Error + 'a>> {
-    parse_compat(input, Compat::Cargo)
+    parse_compat(input, Compat::Npm)
 }
 
 pub fn parse_npm<'a>(input: &'a str) -> Result<RangeSet<'a>, Box<dyn std::error::Error + 'a>> {
@@ -19,24 +19,20 @@ pub fn parse_compat<'a>(
     mut input: &'a str,
     compat: Compat,
 ) -> Result<RangeSet<'a>, Box<dyn std::error::Error + 'a>> {
-    let default_op = match compat {
-        Compat::Cargo => Op::Caret,
-        Compat::Npm => Op::Eq,
-    };
     let mut ranges = vec![];
-    let mut comparators = vec![];
-    let mut allow_chain_operators = true;
+    let mut operations: Vec<Operation> = vec![];
+    let mut allow_chain_operators = false;
     loop {
         let (op, next_input) = match input.as_bytes() {
             &[] => {
-                if !comparators.is_empty() {
-                    ranges.push(Range { comparators });
+                if !operations.is_empty() {
+                    ranges.push(operations);
                 }
-                return Ok(RangeSet { ranges });
+                break;
             }
             &[b'|', b'|', ..] if allow_chain_operators => {
-                let comparators = std::mem::take(&mut comparators);
-                ranges.push(Range { comparators });
+                let operations = std::mem::take(&mut operations);
+                ranges.push(operations);
                 input = &input[2..];
                 allow_chain_operators = false;
                 continue;
@@ -46,7 +42,7 @@ pub fn parse_compat<'a>(
                 allow_chain_operators = false;
                 continue;
             }
-            &[b' ', ..] if allow_chain_operators => {
+            &[b' ', ..] => {
                 input = &input[1..];
                 continue;
             }
@@ -58,44 +54,69 @@ pub fn parse_compat<'a>(
             &[b'<', b'=', ..] => (Op::Lte, &input[2..]),
             &[b'<', ..] => (Op::Lt, &input[1..]),
             &[b'=', ..] => (Op::Eq, &input[1..]),
-            _ => (default_op, input),
+            _ => (Op::Nothing, input),
         };
 
         let (version, remainder) = parse_partial::<VersionQualifier<'a>>(next_input)?;
+        let op = match op {
+            Op::Nothing => Operation::Default(version),
+            Op::Eq => Operation::Apply(Operator::Eq, version),
+            Op::Gt => Operation::Apply(Operator::Gt, version),
+            Op::Gte => Operation::Apply(Operator::Gte, version),
+            Op::Lt => Operation::Apply(Operator::Lt, version),
+            Op::Lte => Operation::Apply(Operator::Lte, version),
+            Op::Tilde => Operation::Tilde(version),
+            Op::Caret => Operation::Caret(version),
+            Op::Hyphen => {
+                let prev = operations
+                    .pop()
+                    .ok_or_else(|| String::from("The hyphen operator requires a previous range"))?;
 
-        let prev = if op == Op::Hyphen {
-            let prev = comparators
-                .pop()
-                .ok_or_else(|| String::from("The hyphen operator requires a previous range"))?;
+                let prev = match prev {
+                    Operation::Default(prev) => prev,
+                    otherwise => {
+                        Err(format!(
+                            "The hyphen operator does not allow the previous range to use an operator, but the previous entry is {:?}",
+                            otherwise
+                        ))?;
+                        unreachable!()
+                    }
+                };
 
-            if prev.op != Operator::Eq {
-                Err(format!(
-                    "The hyphen operator does not allow the previous range to use an operator, but the version [{}] is using the operator [{:?}]",
-                    prev.version, prev.op
-                ))?;
+                Operation::Hyphen(prev, version)
             }
-
-            Some(prev.version)
-        } else {
-            None
         };
+        operations.push(op);
 
-        let ((op, version), other) = version.into_versions(op, prev);
-        comparators.push(Comparator { op, version });
-        if let Some((op, version)) = other {
-            comparators.push(Comparator { op, version });
-        }
-
+        allow_chain_operators = true;
         input = remainder;
     }
+
+    let ranges = ranges
+        .into_iter()
+        .map(|ops| {
+            let mut comparators = Vec::with_capacity(ops.len());
+            for op in ops {
+                let (first, second) = op.into_versions(compat);
+                comparators.push(first);
+                if let Some(comparator) = second {
+                    comparators.push(comparator);
+                }
+            }
+
+            Range { comparators }
+        })
+        .collect();
+
+    Ok(RangeSet { ranges })
 }
 
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RangeSet<'input> {
     ranges: Vec<Range<'input>>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Compat {
     /// default  operator is ^
     Cargo,
@@ -103,18 +124,34 @@ pub enum Compat {
     Npm,
 }
 
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct Range<'input> {
     comparators: Vec<Comparator<'input>>,
 }
 
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct Comparator<'input> {
     op: Operator,
     version: Version<'input>,
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+impl<'input> Comparator<'input> {
+    fn gte(version: Version<'input>) -> Self {
+        Self {
+            op: Operator::Gte,
+            version,
+        }
+    }
+
+    fn lt(version: Version<'input>) -> Self {
+        Self {
+            op: Operator::Lt,
+            version,
+        }
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum Operator {
     /// Equal, =
     Eq,
@@ -128,8 +165,9 @@ enum Operator {
     Lte,
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 enum Op {
+    Nothing,
     Eq,
     Gt,
     Gte,
@@ -140,14 +178,23 @@ enum Op {
     Hyphen,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Operation<'input> {
+    Default(VersionQualifier<'input>),
+    Apply(Operator, VersionQualifier<'input>),
+    Tilde(VersionQualifier<'input>),
+    Caret(VersionQualifier<'input>),
+    Hyphen(VersionQualifier<'input>, VersionQualifier<'input>),
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 enum VersionNumber {
     Unspecified,
     Wildcard,
     Num(u64),
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 enum Segment {
     Empty,
     Major,
@@ -167,7 +214,7 @@ impl From<VersionNumber> for u64 {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct VersionQualifier<'input> {
     segment: Segment,
     major: VersionNumber,
@@ -247,78 +294,66 @@ impl<'input> VersionBuilder<'input> for VersionQualifier<'input> {
     }
 }
 
-impl<'input> VersionQualifier<'input> {
-    fn into_versions(
-        self,
-        op: Op,
-        prev: Option<Version<'input>>,
-    ) -> (
-        (Operator, Version<'input>),
-        Option<(Operator, Version<'input>)>,
-    ) {
-        match op {
-            Op::Eq | Op::Gt | Op::Gte | Op::Lt | Op::Lte => (
-                (
-                    match op {
-                        Op::Eq => Operator::Eq,
-                        Op::Gt => Operator::Gt,
-                        Op::Gte => Operator::Gte,
-                        Op::Lt => Operator::Lt,
-                        Op::Lte => Operator::Lte,
-                        Op::Tilde => unreachable!(),
-                        Op::Caret => unreachable!(),
-                        Op::Hyphen => unreachable!(),
+impl<'input> Operation<'input> {
+    fn into_versions(self, compat: Compat) -> (Comparator<'input>, Option<Comparator<'input>>) {
+        match self {
+            Operation::Default(v) => match compat {
+                Compat::Cargo => Operation::Caret(v).into_versions(compat),
+                Compat::Npm => Operation::Apply(Operator::Eq, v).into_versions(compat),
+            },
+            Operation::Apply(op, v) => (
+                Comparator {
+                    op,
+                    version: Version {
+                        major: v.major.into(),
+                        minor: v.minor.into(),
+                        patch: v.patch.into(),
+                        additional: v.additional.into_iter().map(u64::from).collect(),
+                        pre: v.pre,
+                        build: v.build,
                     },
-                    Version {
-                        major: self.major.into(),
-                        minor: self.minor.into(),
-                        patch: self.patch.into(),
-                        additional: self.additional.into_iter().map(u64::from).collect(),
-                        pre: self.pre,
-                        build: self.build,
-                    },
-                ),
+                },
                 None,
             ),
-            Op::Tilde => match self.segment {
-                Segment::Empty => ((Operator::Gte, Version::new(0, 0, 0)), None),
+            Operation::Tilde(v) => match v.segment {
+                Segment::Empty => (Comparator::gte(Version::new(0, 0, 0)), None),
                 Segment::Major => {
-                    let major = u64::from(self.major);
+                    let major = u64::from(v.major);
                     (
-                        (Operator::Gte, Version::new(major, 0, 0)),
+                        Comparator::gte(Version::new(major, 0, 0)),
                         major
                             .checked_add(1)
-                            .map(|m| (Operator::Lt, Version::new(m, 0, 0))),
+                            .map(|m| Comparator::lt(Version::new(m, 0, 0))),
                     )
                 }
                 Segment::Minor => {
-                    let major = u64::from(self.major);
-                    let minor = u64::from(self.minor);
+                    let major = u64::from(v.major);
+                    let minor = u64::from(v.minor);
                     (
-                        (Operator::Gte, Version::new(major, minor, 0)),
+                        Comparator::gte(Version::new(major, minor, 0)),
                         minor
                             .checked_add(1)
-                            .map(|m| (Operator::Lt, Version::new(major, m, 0))),
+                            .map(|m| Comparator::lt(Version::new(major, m, 0))),
                     )
                 }
                 Segment::Patch => {
-                    let major = u64::from(self.major);
-                    let minor = u64::from(self.minor);
-                    let patch = u64::from(self.patch);
+                    let major = u64::from(v.major);
+                    let minor = u64::from(v.minor);
+                    let patch = u64::from(v.patch);
                     (
-                        (Operator::Gte, Version::new(major, minor, patch)),
+                        Comparator::gte(Version::new(major, minor, patch)),
                         minor
                             .checked_add(1)
-                            .map(|m| (Operator::Lt, Version::new(major, minor, m))),
+                            .map(|m| Comparator::lt(Version::new(major, minor, m))),
                     )
                 }
                 Segment::Additional => {
-                    let major = u64::from(self.major);
-                    let minor = u64::from(self.minor);
-                    let patch = u64::from(self.patch);
+                    let major = u64::from(v.major);
+                    let minor = u64::from(v.minor);
+                    let patch = u64::from(v.patch);
 
                     let mut min = Version::new(major, minor, patch);
-                    min.additional = self.additional.into_iter().map(u64::from).collect();
+                    min.additional = v.additional.into_iter().map(u64::from).collect();
 
                     let max = min
                         .additional
@@ -330,63 +365,63 @@ impl<'input> VersionQualifier<'input> {
                             *add.last_mut().expect("empty additional") = m;
                             let mut max = Version::new(major, minor, patch);
                             max.additional = add;
-                            (Operator::Lt, max)
+                            Comparator::lt(max)
                         });
 
-                    ((Operator::Gte, min), max)
+                    (Comparator::gte(min), max)
                 }
                 Segment::PreRelease => {
                     let min = Version {
-                        major: u64::from(self.major),
-                        minor: u64::from(self.minor),
-                        patch: u64::from(self.patch),
-                        additional: self.additional.into_iter().map(u64::from).collect(),
-                        pre: self.pre,
-                        build: self.build,
+                        major: u64::from(v.major),
+                        minor: u64::from(v.minor),
+                        patch: u64::from(v.patch),
+                        additional: v.additional.into_iter().map(u64::from).collect(),
+                        pre: v.pre,
+                        build: v.build,
                     };
                     let max = min.clone();
-                    ((Operator::Gte, min), Some((Operator::Lt, max)))
+                    (Comparator::gte(min), Some(Comparator::lt(max)))
                 }
             },
-            Op::Caret => {
-                let major = u64::from(self.major);
-                let minor = u64::from(self.minor);
-                let patch = u64::from(self.patch);
+            Operation::Caret(v) => {
+                let major = u64::from(v.major);
+                let minor = u64::from(v.minor);
+                let patch = u64::from(v.patch);
 
                 if major > 0 {
                     (
-                        (Operator::Gte, Version::new(major, minor, patch)),
+                        Comparator::gte(Version::new(major, minor, patch)),
                         major
                             .checked_add(1)
-                            .map(|m| (Operator::Lt, Version::new(m, 0, 0))),
+                            .map(|m| Comparator::lt(Version::new(m, 0, 0))),
                     )
                 } else if minor > 0 {
                     (
-                        (Operator::Gte, Version::new(0, minor, patch)),
+                        Comparator::gte(Version::new(0, minor, patch)),
                         minor
                             .checked_add(1)
-                            .map(|m| (Operator::Lt, Version::new(0, m, 0))),
+                            .map(|m| Comparator::lt(Version::new(0, m, 0))),
                     )
                 } else if patch > 0 {
                     (
-                        (Operator::Gte, Version::new(0, 0, patch)),
+                        Comparator::gte(Version::new(0, 0, patch)),
                         patch
                             .checked_add(1)
-                            .map(|m| (Operator::Lt, Version::new(0, 0, m))),
+                            .map(|m| Comparator::lt(Version::new(0, 0, m))),
                     )
                 } else {
-                    match self.segment {
+                    match v.segment {
                         Segment::Major => (
-                            (Operator::Gte, Version::empty()),
-                            Some((Operator::Lt, Version::new(1, 0, 0))),
+                            Comparator::gte(Version::empty()),
+                            Some(Comparator::lt(Version::new(1, 0, 0))),
                         ),
                         Segment::Minor => (
-                            (Operator::Gte, Version::empty()),
-                            Some((Operator::Lt, Version::new(0, 1, 0))),
+                            Comparator::gte(Version::empty()),
+                            Some(Comparator::lt(Version::new(0, 1, 0))),
                         ),
                         Segment::Patch => (
-                            (Operator::Gte, Version::empty()),
-                            Some((Operator::Lt, Version::new(0, 0, 1))),
+                            Comparator::gte(Version::empty()),
+                            Some(Comparator::lt(Version::new(0, 0, 1))),
                         ),
                         Segment::Empty => {
                             todo!()
@@ -400,24 +435,28 @@ impl<'input> VersionQualifier<'input> {
                     }
                 }
             }
-            Op::Hyphen => {
-                let prev = (Operator::Gte, prev.expect("previous version"));
-                let next = match self.segment {
+            Operation::Hyphen(prev, next) => {
+                let (prev, _) = Operation::Apply(Operator::Gte, prev).into_versions(compat);
+                let next = match next.segment {
                     Segment::Empty => None,
                     Segment::Major => {
-                        let major = u64::from(self.major);
+                        let major = u64::from(next.major);
                         major
                             .checked_add(1)
-                            .map(|m| (Operator::Lt, Version::new(m, 0, 0)))
+                            .map(|m| Comparator::lt(Version::new(m, 0, 0)))
                     }
                     Segment::Minor => {
-                        let major = u64::from(self.major);
-                        let minor = u64::from(self.minor);
+                        let major = u64::from(next.major);
+                        let minor = u64::from(next.minor);
                         minor
                             .checked_add(1)
-                            .map(|m| (Operator::Lt, Version::new(major, m, 0)))
+                            .map(|m| Comparator::lt(Version::new(major, m, 0)))
                     }
-                    _ => Some(self.into_versions(Op::Lte, None).0),
+                    _ => Some(
+                        Operation::Apply(Operator::Lte, next)
+                            .into_versions(compat)
+                            .0,
+                    ),
                 };
                 (prev, next)
             }
