@@ -1,0 +1,18 @@
+[package]
+name = "lenient_semver_range"
+version = "0.0.1"
+description = "Lenient Semantic Version range."
+authors = ["Paul Horn <developer@knutwalker.de>"]
+edition = "2018"
+license = "MIT OR Apache-2.0"
+homepage = "https://github.com/knutwalker/lenient-semver-range/"
+repository = "https://github.com/knutwalker/lenient-semver-range/"
+categories = ["development-tools", "parser-implementations"]
+keywords = ["lenient", "loose", "parser", "semver", "semantic", "version"]
+
+[dependencies]
+lenient_semver_parser = { version = "0.3", default-features = false }
+lenient_version = { version = "0.3", default-features = false, features = [ "parser" ] }
+
+[patch.crates-io]
+lenient_semver_parser = { git = "https://github.com/knutwalker/lenient-semver", package = "lenient_semver_parser", branch = "master" }
