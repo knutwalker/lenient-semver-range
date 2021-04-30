@@ -16,3 +16,6 @@ lenient_version = { version = "0.3", default-features = false, features = [ "par
 
 [patch.crates-io]
 lenient_semver_parser = { git = "https://github.com/knutwalker/lenient-semver", package = "lenient_semver_parser", branch = "master" }
+
+[dev-dependencies]
+pretty_assertions = "0.7.2"

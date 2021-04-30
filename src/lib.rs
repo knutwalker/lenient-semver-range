@@ -6,23 +6,24 @@ Lenient parser or Semantic Version ranges.
 
 use lenient_semver_parser::{parse_partial, ErrorKind, VersionBuilder};
 use lenient_version::Version;
+use std::cmp::Ordering;
 
-pub fn parse<'a>(input: &'a str) -> Result<RangeSet<'a>, Box<dyn std::error::Error + 'a>> {
-    parse_compat(input, Compat::Npm)
-}
-
-pub fn parse_cargp<'a>(input: &'a str) -> Result<RangeSet<'a>, Box<dyn std::error::Error + 'a>> {
+pub fn parse<'input>(input: &'input str) -> Result<RangeSet<'input>, Error<'input>> {
     parse_compat(input, Compat::Cargo)
 }
 
-pub fn parse_npm<'a>(input: &'a str) -> Result<RangeSet<'a>, Box<dyn std::error::Error + 'a>> {
+pub fn parse_cargo<'input>(input: &'input str) -> Result<RangeSet<'input>, Error<'input>> {
+    parse_compat(input, Compat::Cargo)
+}
+
+pub fn parse_npm<'input>(input: &'input str) -> Result<RangeSet<'input>, Error<'input>> {
     parse_compat(input, Compat::Npm)
 }
 
 pub fn parse_compat<'input>(
     mut input: &'input str,
     compat: Compat,
-) -> Result<RangeSet<'input>, Box<dyn std::error::Error + 'input>> {
+) -> Result<RangeSet<'input>, Error<'input>> {
     let mut ranges = vec![];
     let mut operations: Vec<Operation> = vec![];
     let mut allow_chain_operators = false;
@@ -72,18 +73,12 @@ pub fn parse_compat<'input>(
             Op::Tilde => Operation::Tilde(version),
             Op::Caret => Operation::Caret(version),
             Op::Hyphen => {
-                let prev = operations
-                    .pop()
-                    .ok_or_else(|| String::from("The hyphen operator requires a previous range"))?;
+                let prev = operations.pop().ok_or(Error::SingleHyphen)?;
 
                 let prev = match prev {
                     Operation::Default(prev) => prev,
                     otherwise => {
-                        Err(format!(
-                            "The hyphen operator does not allow the previous range to use an operator, but the previous entry is {:?}",
-                            otherwise
-                        ))?;
-                        unreachable!()
+                        return Err(Error::HyphenAfterNonEq(ErrorOp(otherwise)));
                     }
                 };
 
@@ -133,9 +128,83 @@ fn parse_next_version<'input>(
     }
 }
 
+/// Possible parsing errors
+#[derive(Debug)]
+pub enum Error<'input> {
+    SingleHyphen,
+    HyphenAfterNonEq(ErrorOp<'input>),
+    Parsing(lenient_semver_parser::OwnedError),
+}
+
+#[derive(Debug)]
+pub struct ErrorOp<'input>(Operation<'input>);
+
+impl std::error::Error for Error<'_> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Parsing(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for Error<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Error::SingleHyphen => write!(f, "The hyphen operator requires a previous range and cannot be used standalone"),
+            Error::HyphenAfterNonEq(prev) => write!(
+                f,
+                "The hyphen operator does not allow the previous range to use an operator, but the previous entry is {:?}",
+                prev.0
+            ),
+            Error::Parsing(v) => write!(f, "{}", v)
+        }
+    }
+}
+
+impl<'input> From<lenient_semver_parser::Error<'input>> for Error<'input> {
+    fn from(e: lenient_semver_parser::Error<'input>) -> Self {
+        Self::Parsing(e.owned())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RangeSet<'input> {
     ranges: Vec<Range<'input>>,
+}
+
+impl<'input> RangeSet<'input> {
+    fn any() -> Self {
+        Self { ranges: vec![] }
+    }
+
+    fn matches<'v>(&self, version: &Version<'v>) -> bool {
+        // no ranges means anything matches
+        if self.ranges.is_empty() {
+            return true;
+        }
+
+        self.ranges.iter().any(|r| r.matches(version))
+    }
+}
+
+impl<'input> Range<'input> {
+    fn matches<'v>(&self, version: &Version<'v>) -> bool {
+        self.comparators.iter().all(|c| c.matches(version))
+    }
+}
+
+impl<'input> Comparator<'input> {
+    fn matches<'v>(&self, version: &Version<'v>) -> bool {
+        let cmp = dbg!(dbg!(version).cmp(dbg!(&self.version)));
+        dbg!(match dbg!(self.op) {
+            Operator::Eq => matches!(cmp, Ordering::Equal),
+            Operator::Gt => matches!(cmp, Ordering::Greater),
+            Operator::Gte => !matches!(cmp, Ordering::Less),
+            Operator::Lt => matches!(cmp, Ordering::Less),
+            Operator::Lte => !matches!(cmp, Ordering::Greater),
+        })
+    }
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -512,6 +581,664 @@ impl<'input> Operation<'input> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn test_caret_1() {
+        assert_eq!(
+            parse("^1.2.3").unwrap(),
+            RangeSet {
+                ranges: vec![Range {
+                    comparators: vec![
+                        Comparator {
+                            op: Operator::Gte,
+                            version: Version::new(1, 2, 3)
+                        },
+                        Comparator {
+                            op: Operator::Lt,
+                            version: Version::new(2, 0, 0)
+                        },
+                    ]
+                }]
+            }
+        );
+        assert_eq!(parse("^1.2.3").unwrap(), parse(">=1.2.3, <2.0.0").unwrap());
+    }
+
+    #[test]
+    fn test_caret_2() {
+        assert_eq!(
+            parse("^1.2").unwrap(),
+            RangeSet {
+                ranges: vec![Range {
+                    comparators: vec![
+                        Comparator {
+                            op: Operator::Gte,
+                            version: Version::new(1, 2, 0)
+                        },
+                        Comparator {
+                            op: Operator::Lt,
+                            version: Version::new(2, 0, 0)
+                        },
+                    ]
+                }]
+            }
+        );
+        assert_eq!(parse("^1.2").unwrap(), parse(">=1.2.0, <2.0.0").unwrap());
+    }
+
+    #[test]
+    fn test_caret_3() {
+        assert_eq!(
+            parse("^1.2.x").unwrap(),
+            RangeSet {
+                ranges: vec![Range {
+                    comparators: vec![
+                        Comparator {
+                            op: Operator::Gte,
+                            version: Version::new(1, 2, 0)
+                        },
+                        Comparator {
+                            op: Operator::Lt,
+                            version: Version::new(2, 0, 0)
+                        },
+                    ]
+                }]
+            }
+        );
+        assert_eq!(parse("^1.2.x").unwrap(), parse(">=1.2.0, <2.0.0").unwrap());
+    }
+
+    #[test]
+    fn test_caret_4() {
+        assert_eq!(
+            parse("^1").unwrap(),
+            RangeSet {
+                ranges: vec![Range {
+                    comparators: vec![
+                        Comparator {
+                            op: Operator::Gte,
+                            version: Version::new(1, 0, 0)
+                        },
+                        Comparator {
+                            op: Operator::Lt,
+                            version: Version::new(2, 0, 0)
+                        },
+                    ]
+                }]
+            }
+        );
+        assert_eq!(parse("^1").unwrap(), parse(">=1.0.0, <2.0.0").unwrap());
+    }
+
+    #[test]
+    fn test_caret_5() {
+        assert_eq!(
+            parse("^1.x").unwrap(),
+            RangeSet {
+                ranges: vec![Range {
+                    comparators: vec![
+                        Comparator {
+                            op: Operator::Gte,
+                            version: Version::new(1, 0, 0)
+                        },
+                        Comparator {
+                            op: Operator::Lt,
+                            version: Version::new(2, 0, 0)
+                        },
+                    ]
+                }]
+            }
+        );
+        assert_eq!(parse("^1.x").unwrap(), parse(">=1.0.0, <2.0.0").unwrap());
+    }
+
+    #[test]
+    fn test_caret_6() {
+        assert_eq!(
+            parse("^0.2.3").unwrap(),
+            RangeSet {
+                ranges: vec![Range {
+                    comparators: vec![
+                        Comparator {
+                            op: Operator::Gte,
+                            version: Version::new(0, 2, 3)
+                        },
+                        Comparator {
+                            op: Operator::Lt,
+                            version: Version::new(0, 3, 0)
+                        },
+                    ]
+                }]
+            }
+        );
+        assert_eq!(parse("^0.2.3").unwrap(), parse(">=0.2.3, <0.3.0").unwrap());
+    }
+
+    #[test]
+    fn test_caret_7() {
+        assert_eq!(
+            parse("^0.2").unwrap(),
+            RangeSet {
+                ranges: vec![Range {
+                    comparators: vec![
+                        Comparator {
+                            op: Operator::Gte,
+                            version: Version::new(0, 2, 0)
+                        },
+                        Comparator {
+                            op: Operator::Lt,
+                            version: Version::new(0, 3, 0)
+                        },
+                    ]
+                }]
+            }
+        );
+        assert_eq!(parse("^0.2").unwrap(), parse(">=0.2.0, <0.3.0").unwrap());
+    }
+
+    #[test]
+    fn test_caret_8() {
+        assert_eq!(
+            parse("^0.0.3").unwrap(),
+            RangeSet {
+                ranges: vec![Range {
+                    comparators: vec![
+                        Comparator {
+                            op: Operator::Gte,
+                            version: Version::new(0, 0, 3)
+                        },
+                        Comparator {
+                            op: Operator::Lt,
+                            version: Version::new(0, 0, 4)
+                        },
+                    ]
+                }]
+            }
+        );
+        assert_eq!(parse("^0.0.3").unwrap(), parse(">=0.0.3, <0.0.4").unwrap());
+    }
+
+    #[test]
+    fn test_caret_9() {
+        assert_eq!(
+            parse("^0.0").unwrap(),
+            RangeSet {
+                ranges: vec![Range {
+                    comparators: vec![
+                        Comparator {
+                            op: Operator::Gte,
+                            version: Version::new(0, 0, 0)
+                        },
+                        Comparator {
+                            op: Operator::Lt,
+                            version: Version::new(0, 1, 0)
+                        },
+                    ]
+                }]
+            }
+        );
+        assert_eq!(parse("^0.0").unwrap(), parse(">=0.0.0, <0.1.0").unwrap());
+    }
+
+    #[test]
+    fn test_caret_10() {
+        assert_eq!(
+            parse("^0.0.x").unwrap(),
+            RangeSet {
+                ranges: vec![Range {
+                    comparators: vec![
+                        Comparator {
+                            op: Operator::Gte,
+                            version: Version::new(0, 0, 0)
+                        },
+                        Comparator {
+                            op: Operator::Lt,
+                            version: Version::new(0, 1, 0)
+                        },
+                    ]
+                }]
+            }
+        );
+        assert_eq!(parse("^0.0.x").unwrap(), parse(">=0.0.0, <0.1.0").unwrap());
+    }
+
+    #[test]
+    fn test_caret_11() {
+        assert_eq!(
+            parse("^0").unwrap(),
+            RangeSet {
+                ranges: vec![Range {
+                    comparators: vec![
+                        Comparator {
+                            op: Operator::Gte,
+                            version: Version::new(0, 0, 0)
+                        },
+                        Comparator {
+                            op: Operator::Lt,
+                            version: Version::new(1, 0, 0)
+                        },
+                    ]
+                }]
+            }
+        );
+        assert_eq!(parse("^0").unwrap(), parse(">=0.0.0, <1.0.0").unwrap());
+    }
+
+    #[test]
+    fn test_caret_12() {
+        assert_eq!(
+            parse("^0.x").unwrap(),
+            RangeSet {
+                ranges: vec![Range {
+                    comparators: vec![
+                        Comparator {
+                            op: Operator::Gte,
+                            version: Version::new(0, 0, 0)
+                        },
+                        Comparator {
+                            op: Operator::Lt,
+                            version: Version::new(1, 0, 0)
+                        },
+                    ]
+                }]
+            }
+        );
+        assert_eq!(parse("^0.x").unwrap(), parse(">=0.0.0, <1.0.0").unwrap());
+    }
+
+    #[test]
+    fn test_caret_13() {
+        assert_eq!(
+            parse("^1.2.3.4").unwrap(),
+            RangeSet {
+                ranges: vec![Range {
+                    comparators: vec![
+                        Comparator {
+                            op: Operator::Gte,
+                            version: Version {
+                                additional: vec![4],
+                                ..Version::new(1, 2, 3)
+                            }
+                        },
+                        Comparator {
+                            op: Operator::Lt,
+                            version: Version::new(2, 0, 0)
+                        },
+                    ]
+                }]
+            }
+        );
+        assert_eq!(
+            parse("^1.2.3.4").unwrap(),
+            parse(">=1.2.3.4, <2.0.0").unwrap()
+        );
+    }
+
+    #[test]
+    fn test_caret_14() {
+        assert_eq!(
+            parse("^1.2.3-beta.2").unwrap(),
+            RangeSet {
+                ranges: vec![Range {
+                    comparators: vec![
+                        Comparator {
+                            op: Operator::Gte,
+                            version: Version {
+                                build: vec!["beta.2"],
+                                ..Version::new(1, 2, 3)
+                            }
+                        },
+                        Comparator {
+                            op: Operator::Lt,
+                            version: Version::new(2, 0, 0)
+                        },
+                    ]
+                }]
+            }
+        );
+        assert_eq!(
+            parse("^1.2.3-beta.2").unwrap(),
+            parse(">=1.2.3-beta.2, <2.0.0").unwrap()
+        );
+    }
+
+    #[test]
+    fn test_caret_15() {
+        assert_eq!(
+            parse("^0.0.3-beta").unwrap(),
+            RangeSet {
+                ranges: vec![Range {
+                    comparators: vec![
+                        Comparator {
+                            op: Operator::Gte,
+                            version: Version {
+                                build: vec!["beta"],
+                                ..Version::new(0, 0, 3)
+                            }
+                        },
+                        Comparator {
+                            op: Operator::Lt,
+                            version: Version::new(0, 0, 4)
+                        },
+                    ]
+                }]
+            }
+        );
+        assert_eq!(
+            parse("^0.0.3-beta").unwrap(),
+            parse(">=0.0.3-beta, <0.0.4").unwrap()
+        );
+    }
+
+    #[test]
+    fn test_tilde_1() {
+        assert_eq!(
+            parse("~1.2.3").unwrap(),
+            RangeSet {
+                ranges: vec![Range {
+                    comparators: vec![
+                        Comparator {
+                            op: Operator::Gte,
+                            version: Version::new(1, 2, 3)
+                        },
+                        Comparator {
+                            op: Operator::Lt,
+                            version: Version::new(1, 3, 0)
+                        },
+                    ]
+                }]
+            }
+        );
+        assert_eq!(parse("~1.2.3").unwrap(), parse(">=1.2.3, <1.3.0").unwrap());
+    }
+
+    #[test]
+    fn test_tilde_2() {
+        assert_eq!(
+            parse("~1.2").unwrap(),
+            RangeSet {
+                ranges: vec![Range {
+                    comparators: vec![
+                        Comparator {
+                            op: Operator::Gte,
+                            version: Version::new(1, 2, 0)
+                        },
+                        Comparator {
+                            op: Operator::Lt,
+                            version: Version::new(1, 3, 0)
+                        },
+                    ]
+                }]
+            }
+        );
+        assert_eq!(parse("~1.2").unwrap(), parse(">=1.2.0, <1.3.0").unwrap());
+    }
+
+    #[test]
+    fn test_tilde_3() {
+        assert_eq!(
+            parse("~1").unwrap(),
+            RangeSet {
+                ranges: vec![Range {
+                    comparators: vec![
+                        Comparator {
+                            op: Operator::Gte,
+                            version: Version::new(1, 0, 0)
+                        },
+                        Comparator {
+                            op: Operator::Lt,
+                            version: Version::new(2, 0, 0)
+                        },
+                    ]
+                }]
+            }
+        );
+        assert_eq!(parse("~1").unwrap(), parse(">=1.0.0, <2.0.0").unwrap());
+    }
+
+    #[test]
+    fn test_tilde_4() {
+        assert_eq!(
+            parse("~0.2.3").unwrap(),
+            RangeSet {
+                ranges: vec![Range {
+                    comparators: vec![
+                        Comparator {
+                            op: Operator::Gte,
+                            version: Version::new(0, 2, 3)
+                        },
+                        Comparator {
+                            op: Operator::Lt,
+                            version: Version::new(0, 3, 0)
+                        },
+                    ]
+                }]
+            }
+        );
+        assert_eq!(parse("~0.2.3").unwrap(), parse(">=0.2.3, <0.3.0").unwrap());
+    }
+
+    #[test]
+    fn test_tilde_5() {
+        assert_eq!(
+            parse("~0.2").unwrap(),
+            RangeSet {
+                ranges: vec![Range {
+                    comparators: vec![
+                        Comparator {
+                            op: Operator::Gte,
+                            version: Version::new(0, 2, 0)
+                        },
+                        Comparator {
+                            op: Operator::Lt,
+                            version: Version::new(0, 3, 0)
+                        },
+                    ]
+                }]
+            }
+        );
+        assert_eq!(parse("~0.2").unwrap(), parse(">=0.2.0, <0.3.0").unwrap());
+    }
+
+    #[test]
+    fn test_tilde_6() {
+        assert_eq!(
+            parse("~0").unwrap(),
+            RangeSet {
+                ranges: vec![Range {
+                    comparators: vec![
+                        Comparator {
+                            op: Operator::Gte,
+                            version: Version::new(0, 0, 0)
+                        },
+                        Comparator {
+                            op: Operator::Lt,
+                            version: Version::new(1, 0, 0)
+                        },
+                    ]
+                }]
+            }
+        );
+        assert_eq!(parse("~0").unwrap(), parse(">=0.0.0, <1.0.0").unwrap());
+    }
+
+    #[test]
+    fn test_tilde_7() {
+        assert_eq!(
+            parse("~1.2.3-beta.2").unwrap(),
+            RangeSet {
+                ranges: vec![Range {
+                    comparators: vec![
+                        Comparator {
+                            op: Operator::Gte,
+                            version: Version {
+                                pre: vec!["beta.2"],
+                                ..Version::new(1, 2, 3)
+                            }
+                        },
+                        Comparator {
+                            op: Operator::Lt,
+                            version: Version::new(1, 3, 0)
+                        },
+                    ]
+                }]
+            }
+        );
+        assert_eq!(
+            parse("~1.2.3-beta.2").unwrap(),
+            parse(">=1.2.3-beta.2, <1.3.0").unwrap()
+        );
+    }
+
+    #[test]
+    fn test_tilde_x1() {
+        assert_eq!(
+            parse("1.2.3.x").unwrap(),
+            RangeSet {
+                ranges: vec![Range {
+                    comparators: vec![
+                        Comparator {
+                            op: Operator::Gte,
+                            version: Version {
+                                additional: vec![0],
+                                ..Version::new(1, 2, 3)
+                            }
+                        },
+                        Comparator {
+                            op: Operator::Lt,
+                            version: Version::new(1, 3, 0)
+                        },
+                    ]
+                }]
+            }
+        );
+        assert_eq!(
+            parse("1.2.3.x").unwrap(),
+            parse(">=1.2.3.0, <1.3.0").unwrap()
+        );
+    }
+
+    #[test]
+    fn test_tilde_x2() {
+        assert_eq!(
+            parse("1.2.x").unwrap(),
+            RangeSet {
+                ranges: vec![Range {
+                    comparators: vec![
+                        Comparator {
+                            op: Operator::Gte,
+                            version: Version::new(1, 2, 0)
+                        },
+                        Comparator {
+                            op: Operator::Lt,
+                            version: Version::new(1, 3, 0)
+                        },
+                    ]
+                }]
+            }
+        );
+        assert_eq!(parse("1.2.x").unwrap(), parse(">=1.2.0, <1.3.0").unwrap());
+    }
+
+    #[test]
+    fn test_tilde_x3() {
+        assert_eq!(
+            parse("1.x").unwrap(),
+            RangeSet {
+                ranges: vec![Range {
+                    comparators: vec![
+                        Comparator {
+                            op: Operator::Gte,
+                            version: Version::new(1, 0, 0)
+                        },
+                        Comparator {
+                            op: Operator::Lt,
+                            version: Version::new(2, 0, 0)
+                        },
+                    ]
+                }]
+            }
+        );
+        assert_eq!(parse("1.x").unwrap(), parse(">=1.0.0, <2.0.0").unwrap());
+    }
+
+    #[test]
+    fn test_tilde_x4() {
+        assert_eq!(
+            parse("0.2.3.x").unwrap(),
+            RangeSet {
+                ranges: vec![Range {
+                    comparators: vec![
+                        Comparator {
+                            op: Operator::Gte,
+                            version: Version {
+                                additional: vec![0],
+                                ..Version::new(0, 2, 3)
+                            }
+                        },
+                        Comparator {
+                            op: Operator::Lt,
+                            version: Version::new(0, 3, 0)
+                        },
+                    ]
+                }]
+            }
+        );
+        assert_eq!(
+            parse("0.2.3.x").unwrap(),
+            parse(">=0.2.3.0, <0.3.0").unwrap()
+        );
+    }
+
+    #[test]
+    fn test_tilde_x5() {
+        assert_eq!(
+            parse("0.2.x").unwrap(),
+            RangeSet {
+                ranges: vec![Range {
+                    comparators: vec![
+                        Comparator {
+                            op: Operator::Gte,
+                            version: Version::new(0, 2, 0)
+                        },
+                        Comparator {
+                            op: Operator::Lt,
+                            version: Version::new(0, 3, 0)
+                        },
+                    ]
+                }]
+            }
+        );
+        assert_eq!(parse("0.2.x").unwrap(), parse(">=0.2.0, <0.3.0").unwrap());
+    }
+
+    #[test]
+    fn test_tilde_x6() {
+        assert_eq!(
+            parse("0.x").unwrap(),
+            RangeSet {
+                ranges: vec![Range {
+                    comparators: vec![
+                        Comparator {
+                            op: Operator::Gte,
+                            version: Version::new(0, 0, 0)
+                        },
+                        Comparator {
+                            op: Operator::Lt,
+                            version: Version::new(1, 0, 0)
+                        },
+                    ]
+                }]
+            }
+        );
+        assert_eq!(parse("0.x").unwrap(), parse(">=0.0.0, <1.0.0").unwrap());
+    }
+
+    // =================================================================================================================== //
+    // =================================================================================================================== //
+    // =================================================================================================================== //
+    // =================================================================================================================== //
 
     #[test]
     fn test_hyphen_1() {
@@ -673,300 +1400,6 @@ mod tests {
                         Comparator {
                             op: Operator::Lt,
                             version: Version::new(2, 0, 0)
-                        },
-                    ]
-                }]
-            }
-        );
-    }
-
-    #[test]
-    fn test_tilde_1() {
-        assert_eq!(
-            parse("~1.2.3").unwrap(),
-            RangeSet {
-                ranges: vec![Range {
-                    comparators: vec![
-                        Comparator {
-                            op: Operator::Gte,
-                            version: Version::new(1, 2, 3)
-                        },
-                        Comparator {
-                            op: Operator::Lt,
-                            version: Version::new(1, 3, 0)
-                        },
-                    ]
-                }]
-            }
-        );
-    }
-
-    #[test]
-    fn test_tilde_2() {
-        assert_eq!(
-            parse("~1.2").unwrap(),
-            RangeSet {
-                ranges: vec![Range {
-                    comparators: vec![
-                        Comparator {
-                            op: Operator::Gte,
-                            version: Version::new(1, 2, 0)
-                        },
-                        Comparator {
-                            op: Operator::Lt,
-                            version: Version::new(1, 3, 0)
-                        },
-                    ]
-                }]
-            }
-        );
-    }
-
-    #[test]
-    fn test_tilde_3() {
-        assert_eq!(
-            parse("~1").unwrap(),
-            RangeSet {
-                ranges: vec![Range {
-                    comparators: vec![
-                        Comparator {
-                            op: Operator::Gte,
-                            version: Version::new(1, 0, 0)
-                        },
-                        Comparator {
-                            op: Operator::Lt,
-                            version: Version::new(2, 0, 0)
-                        },
-                    ]
-                }]
-            }
-        );
-    }
-
-    #[test]
-    fn test_tilde_4() {
-        assert_eq!(
-            parse("~0.2.3").unwrap(),
-            RangeSet {
-                ranges: vec![Range {
-                    comparators: vec![
-                        Comparator {
-                            op: Operator::Gte,
-                            version: Version::new(0, 2, 3)
-                        },
-                        Comparator {
-                            op: Operator::Lt,
-                            version: Version::new(0, 3, 0)
-                        },
-                    ]
-                }]
-            }
-        );
-    }
-
-    #[test]
-    fn test_tilde_5() {
-        assert_eq!(
-            parse("~0.2").unwrap(),
-            RangeSet {
-                ranges: vec![Range {
-                    comparators: vec![
-                        Comparator {
-                            op: Operator::Gte,
-                            version: Version::new(0, 2, 0)
-                        },
-                        Comparator {
-                            op: Operator::Lt,
-                            version: Version::new(0, 3, 0)
-                        },
-                    ]
-                }]
-            }
-        );
-    }
-
-    #[test]
-    fn test_tilde_6() {
-        assert_eq!(
-            parse("~0").unwrap(),
-            RangeSet {
-                ranges: vec![Range {
-                    comparators: vec![
-                        Comparator {
-                            op: Operator::Gte,
-                            version: Version::new(0, 0, 0)
-                        },
-                        Comparator {
-                            op: Operator::Lt,
-                            version: Version::new(1, 0, 0)
-                        },
-                    ]
-                }]
-            }
-        );
-    }
-
-    #[test]
-    fn test_caret_1() {
-        assert_eq!(
-            parse("^1.2.3").unwrap(),
-            RangeSet {
-                ranges: vec![Range {
-                    comparators: vec![
-                        Comparator {
-                            op: Operator::Gte,
-                            version: Version::new(1, 2, 3)
-                        },
-                        Comparator {
-                            op: Operator::Lt,
-                            version: Version::new(2, 0, 0)
-                        },
-                    ]
-                }]
-            }
-        );
-    }
-
-    #[test]
-    fn test_caret_2() {
-        assert_eq!(
-            parse("^0.2.3").unwrap(),
-            RangeSet {
-                ranges: vec![Range {
-                    comparators: vec![
-                        Comparator {
-                            op: Operator::Gte,
-                            version: Version::new(0, 2, 3)
-                        },
-                        Comparator {
-                            op: Operator::Lt,
-                            version: Version::new(0, 3, 0)
-                        },
-                    ]
-                }]
-            }
-        );
-    }
-
-    #[test]
-    fn test_caret_3() {
-        assert_eq!(
-            parse("^0.0.3").unwrap(),
-            RangeSet {
-                ranges: vec![Range {
-                    comparators: vec![
-                        Comparator {
-                            op: Operator::Gte,
-                            version: Version::new(0, 0, 3)
-                        },
-                        Comparator {
-                            op: Operator::Lt,
-                            version: Version::new(0, 0, 4)
-                        },
-                    ]
-                }]
-            }
-        );
-    }
-
-    #[test]
-    fn test_caret_4() {
-        assert_eq!(
-            parse("^1.2.x").unwrap(),
-            RangeSet {
-                ranges: vec![Range {
-                    comparators: vec![
-                        Comparator {
-                            op: Operator::Gte,
-                            version: Version::new(1, 2, 0)
-                        },
-                        Comparator {
-                            op: Operator::Lt,
-                            version: Version::new(2, 0, 0)
-                        },
-                    ]
-                }]
-            }
-        );
-    }
-
-    #[test]
-    fn test_caret_5() {
-        assert_eq!(
-            parse("^0.0.x").unwrap(),
-            RangeSet {
-                ranges: vec![Range {
-                    comparators: vec![
-                        Comparator {
-                            op: Operator::Gte,
-                            version: Version::new(0, 0, 0)
-                        },
-                        Comparator {
-                            op: Operator::Lt,
-                            version: Version::new(0, 1, 0)
-                        },
-                    ]
-                }]
-            }
-        );
-    }
-
-    #[test]
-    fn test_caret_6() {
-        assert_eq!(
-            parse("^0.0").unwrap(),
-            RangeSet {
-                ranges: vec![Range {
-                    comparators: vec![
-                        Comparator {
-                            op: Operator::Gte,
-                            version: Version::new(0, 0, 0)
-                        },
-                        Comparator {
-                            op: Operator::Lt,
-                            version: Version::new(0, 1, 0)
-                        },
-                    ]
-                }]
-            }
-        );
-    }
-
-    #[test]
-    fn test_caret_7() {
-        assert_eq!(
-            parse("^1.x").unwrap(),
-            RangeSet {
-                ranges: vec![Range {
-                    comparators: vec![
-                        Comparator {
-                            op: Operator::Gte,
-                            version: Version::new(1, 0, 0)
-                        },
-                        Comparator {
-                            op: Operator::Lt,
-                            version: Version::new(2, 0, 0)
-                        },
-                    ]
-                }]
-            }
-        );
-    }
-
-    #[test]
-    fn test_caret_8() {
-        assert_eq!(
-            parse("^0.x").unwrap(),
-            RangeSet {
-                ranges: vec![Range {
-                    comparators: vec![
-                        Comparator {
-                            op: Operator::Gte,
-                            version: Version::new(0, 0, 0)
-                        },
-                        Comparator {
-                            op: Operator::Lt,
-                            version: Version::new(1, 0, 0)
                         },
                     ]
                 }]
