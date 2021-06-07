@@ -12,7 +12,7 @@ keywords = ["lenient", "loose", "parser", "semver", "semantic", "version"]
 
 [dependencies]
 lenient_semver_parser = { version = "0.3", default-features = false }
-lenient_version = { version = "0.3", default-features = false, features = [ "parser" ] }
+lenient_version = { version = "0.4", default-features = false, features = [ "parser" ] }
 
 [patch.crates-io]
 lenient_semver_parser = { git = "https://github.com/knutwalker/lenient-semver", package = "lenient_semver_parser", branch = "master" }
